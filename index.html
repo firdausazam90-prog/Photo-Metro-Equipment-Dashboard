@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Equipment Performance Dashboard</title>
+  <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+  <style>
+    :root { --brand:#1a2a4f; --accent:#e74c3c; --bg:#f6f7fb; --card:#fff; }
+    body { font-family: Arial, sans-serif; margin: 0; background: var(--bg); color:#222; }
+    header { padding: 12px 20px; background: var(--brand); color: #fff; }
+    h1 { margin: 0; font-size: 20px; }
+    #controls { margin-top: 10px; display: flex; gap: 10px; flex-wrap: wrap; }
+    select, input[type=file], input[type=date], button {
+      padding: 6px 8px; border-radius: 6px; border: 1px solid #ccc;
+    }
+    select[multiple] { height: 120px; }
+    button { cursor: pointer; background: var(--accent); color: #fff; border: none; }
+    #kpis { display: grid; grid-template-columns: repeat(5,1fr); gap: 16px; margin: 15px 20px; }
+    .kpi { background: var(--card); padding: 14px; border-radius: 10px; box-shadow: 0 2px 6px rgba(0,0,0,.15); text-align:center; }
+    .kpi h2 { margin: 0; font-size: 14px; color: #666; }
+    .kpi p { margin: 6px 0 0; font-size: 22px; font-weight: bold; color: var(--brand); }
+    #underperforming-tools p { font-size: 16px; color: var(--accent); white-space: pre-wrap; }
+    #charts { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 20px; }
+    .chart { background: var(--card); padding: 14px; border-radius: 10px; box-shadow: 0 2px 6px rgba(0,0,0,.15); min-height: 360px; }
+    .wide { grid-column: span 2; }
+    @media(max-width:1100px){ #charts{grid-template-columns:1fr;} .wide{grid-column: span 1;} #kpis{grid-template-columns:repeat(2,1fr);} }
+    @media(max-width:640px){ #kpis{grid-template-columns:1fr;} }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Interactive Equipment Performance Dashboard</h1>
+    <div id="controls">
+      <input type="file" id="fileInput" accept=".json">
+      <select id="areaFilter" multiple></select>
+      <select id="toolFilter" multiple></select>
+      <label>Start: <input type="date" id="startDate"></label>
+      <label>End: <input type="date" id="endDate"></label>
+      <button id="clearBtn">Clear Filters</button>
+    </div>
+  </header>
+
+  <section id="kpis">
+    <div class="kpi"><h2>Total Uptime %</h2><p id="kpi-total-uptime-pct">-</p></div>
+    <div class="kpi"><h2>Avg Utilization</h2><p id="kpi-util">-</p></div>
+    <div class="kpi"><h2>Avg Availability</h2><p id="kpi-avail">-</p></div>
+    <div class="kpi"><h2>Total Uptime Hours</h2><p id="kpi-uptime">-</p></div>
+    <div class="kpi"><h2>Total Downtime Hours</h2><p id="kpi-downtime">-</p></div>
+    <div class="kpi"><h2>Total Failures</h2><p id="kpi-fail">-</p></div>
+    <div class="kpi"><h2>Avg MTBF (h)</h2><p id="kpi-mtbf">-</p></div>
+    <div class="kpi"><h2>Avg MTTR (h)</h2><p id="kpi-mttr">-</p></div>
+    <div class="kpi" id="underperforming-tools"><h2>Tools Below 94% Uptime</h2><p id="kpi-underperforming">-</p></div>
+  </section>
+
+  <main id="charts">
+    <div id="utilizationChart" class="chart"></div>
+    <div id="uptimeChart" class="chart"></div>
+    <div id="availabilityChart" class="chart"></div>
+    <div id="throughputChart" class="chart"></div>
+    <div id="failureChart" class="chart"></div>
+    <div id="matrixChart" class="chart wide"></div>
+    <div id="reliabilityMatrixChart" class="chart wide"></div>
+    <div id="utilTrendChart" class="chart wide"></div>
+    <div id="throughputTrendChart" class="chart wide"></div>
+    <div id="uptimePctTrendChart" class="chart wide"></div>
+    <div id="uptimeHoursTrendChart" class="chart wide"></div>
+  </main>
+
+  <script>
+    // Global data store and event listeners
+    let globalData = [];
+    let currentFilteredData = [];
+    let currentSelectedTools = [];
+    
+    const requiredKeys = ["TOOLID", "AREA", "UTILIZATION [%]", "AVAILABLE [%]", "ACTMOVE", "FAILCOUNT", "ST_RUN", "ST_IDLE", "ST_ENGR", "ST_FAILED", "ST_PM", "ST_SHUTDOWN", "ST_QUAL", "ST_DELQ", "ST_NONSCH", "ST_WAIT", "INSERTDATE"];
+    
+    document.getElementById('fileInput').addEventListener('change', handleFileUpload);
+    document.getElementById('areaFilter').addEventListener('change', applyFilters);
+    document.getElementById('toolFilter').addEventListener('change', applyFilters);
+    document.getElementById('startDate').addEventListener('change', applyFilters);
+    document.getElementById('endDate').addEventListener('change', applyFilters);
+    document.getElementById('clearBtn').addEventListener('click', clearFilters);
+
+    // Add click event listeners for interactive filtering on bar charts
+    Plotly.newPlot('utilizationChart', [], {});
+    Plotly.newPlot('uptimeChart', [], {});
+    Plotly.newPlot('availabilityChart', [], {});
+
+    ['utilizationChart', 'uptimeChart', 'availabilityChart'].forEach(id => {
+        document.getElementById(id).on('plotly_click', function(data) {
+            if (data.points && data.points.length > 0) {
+                const clickedTool = data.points[0].x;
+                const newSelectedTools = (currentSelectedTools.includes(clickedTool)) ?
+                    currentSelectedTools.filter(t => t !== clickedTool) :
+                    [clickedTool];
+                
+                // Manually select the option in the tool filter dropdown
+                const toolFilter = document.getElementById('toolFilter');
+                Array.from(toolFilter.options).forEach(opt => {
+                    opt.selected = newSelectedTools.includes(opt.value);
+                });
+                
+                applyFilters();
+            }
+        });
+    });
+
+    // Main file handler
+    function handleFileUpload(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+
+      const reader = new FileReader();
+      reader.onload = function(e) {
+        try {
+          const json = JSON.parse(e.target.result);
+          
+          let parsedData = Array.isArray(json) ? json : (json.data || []);
+          
+          if (!parsedData.length) {
+            alert('JSON file is empty or missing a "data" array.');
+            return;
+          }
+
+          const firstRecord = parsedData[0];
+          const missingKeys = requiredKeys.filter(key => !(key in firstRecord));
+          if (missingKeys.length > 0) {
+            alert(`The data file is missing required keys: ${missingKeys.join(', ')}`);
+            return;
+          }
+
+          globalData = parsedData;
+          populateFilters(globalData);
+          buildDashboard(globalData);
+        } catch (err) {
+          alert('Invalid JSON format. Please upload a valid JSON file.');
+          console.error(err);
+        }
+      };
+      reader.readAsText(file);
+    }
+    
+    // UI Filter functions
+    function populateFilters(data) {
+      const areaSet = new Set(data.map(d => d.AREA || "Unknown"));
+      const toolSet = new Set(data.map(d => d.TOOLID || "Unknown"));
+      const dateSet = data.map(d => parseDate(d.INSERTDATE)).filter(Boolean);
+      const af = document.getElementById('areaFilter'),
+            tf = document.getElementById('toolFilter');
+      
+      af.innerHTML = '';
+      tf.innerHTML = '';
+      [...areaSet].sort().forEach(a => af.innerHTML += `<option>${a}</option>`);
+      [...toolSet].sort().forEach(t => tf.innerHTML += `<option>${t}</option>`);
+
+      if (dateSet.length) {
+        const min = new Date(Math.min(...dateSet)),
+              max = new Date(Math.max(...dateSet));
+        document.getElementById('startDate').value = toYMD(min);
+        document.getElementById('endDate').value = toYMD(max);
+      }
+    }
+    
+    function clearFilters() {
+      ['areaFilter', 'toolFilter'].forEach(id => document.getElementById(id).selectedIndex = -1);
+      document.getElementById('startDate').value = '';
+      document.getElementById('endDate').value = '';
+      buildDashboard(globalData);
+    }
+    
+    function applyFilters() {
+      const selA = Array.from(document.getElementById('areaFilter').selectedOptions).map(o => o.value);
+      const selT = Array.from(document.getElementById('toolFilter').selectedOptions).map(o => o.value);
+      const sDate = document.getElementById('startDate').value ? new Date(document.getElementById('startDate').value) : null;
+      const eDate = document.getElementById('endDate').value ? new Date(document.getElementById('endDate').value) : null;
+      
+      currentSelectedTools = selT; // Update global variable for chart interaction logic
+      
+      let filteredData = [...globalData];
+      if (selA.length) filteredData = filteredData.filter(d => selA.includes(d.AREA || "Unknown"));
+      if (selT.length) filteredData = filteredData.filter(d => selT.includes(d.TOOLID || "Unknown"));
+      if (sDate) filteredData = filteredData.filter(d => parseDate(d.INSERTDATE) >= sDate);
+      if (eDate) filteredData = filteredData.filter(d => parseDate(d.INSERTDATE) <= eDate);
+      
+      currentFilteredData = filteredData;
+      buildDashboard(currentFilteredData);
+    }
+    
+    // Aggregation functions for charts and KPIs
+    function aggregateByTool(data) {
+      const aggData = {};
+      data.forEach(d => {
+        const id = d.TOOLID || "Unknown";
+        if (!aggData[id]) {
+          aggData[id] = { TOOLID: id, "UTILIZATION [%]": 0, "AVAILABLE [%]": 0, ACTMOVE: 0, FAILCOUNT: 0, ST_RUN: 0, ST_IDLE: 0, ST_ENGR: 0, ST_FAILED: 0, ST_PM: 0, ST_SHUTDOWN: 0, ST_QUAL: 0, ST_DELQ: 0, ST_NONSCH: 0, ST_WAIT: 0, count: 0 };
+        }
+        aggData[id]["UTILIZATION [%]"] += num(d["UTILIZATION [%]"]);
+        aggData[id]["AVAILABLE [%]"] += num(d["AVAILABLE [%]"]);
+        aggData[id].ACTMOVE += num(d.ACTMOVE);
+        aggData[id].FAILCOUNT += num(d.FAILCOUNT);
+        aggData[id].ST_RUN += num(d.ST_RUN);
+        aggData[id].ST_IDLE += num(d.ST_IDLE);
+        aggData[id].ST_ENGR += num(d.ST_ENGR);
+        aggData[id].ST_FAILED += num(d.ST_FAILED);
+        aggData[id].ST_PM += num(d.ST_PM);
+        aggData[id].ST_SHUTDOWN += num(d.ST_SHUTDOWN);
+        aggData[id].ST_QUAL += num(d.ST_QUAL);
+        aggData[id].ST_DELQ += num(d.ST_DELQ);
+        aggData[id].ST_NONSCH += num(d.ST_NONSCH);
+        aggData[id].ST_WAIT += num(d.ST_WAIT);
+        aggData[id].count += 1;
+      });
+      return Object.values(aggData).map(d => {
+        d["UTILIZATION [%]"] = d["UTILIZATION [%]"] / d.count;
+        d["AVAILABLE [%]"] = d["AVAILABLE [%]"] / d.count;
+        d.avg_moves_per_day = d.ACTMOVE / d.count;
+        return d;
+      });
+    }
+
+    function aggregateByDate(data, fieldName) {
+      const aggMap = {};
+      data.forEach(d => {
+        const date = toYMD(parseDate(d.INSERTDATE));
+        if (date) {
+          if (!aggMap[date]) {
+            aggMap[date] = { sum: 0, count: 0, total: 0 };
+          }
+          const value = num(d[fieldName]);
+          aggMap[date].sum += value;
+          aggMap[date].count += 1;
+          aggMap[date].total += value;
+        }
+      });
+      const dates = Object.keys(aggMap).sort();
+      const avgValues = dates.map(d => aggMap[d].sum / aggMap[d].count);
+      const totalValues = dates.map(d => aggMap[d].total);
+      return { dates, avgValues, totalValues };
+    }
+    
+    function aggregateUptimeDowntimeByDate(data) {
+      const aggMap = {};
+      data.forEach(d => {
+        const date = toYMD(parseDate(d.INSERTDATE));
+        if (date) {
+          if (!aggMap[date]) {
+            aggMap[date] = { up: 0, down: 0 };
+          }
+          const up = num(d.ST_RUN) + num(d.ST_IDLE) + num(d.ST_ENGR);
+          const down = num(d.ST_FAILED) + num(d.ST_PM) + num(d.ST_SHUTDOWN) + num(d.ST_QUAL) + num(d.ST_DELQ) + num(d.ST_NONSCH) + num(d.ST_WAIT);
+          aggMap[date].up += up;
+          aggMap[date].down += down;
+        }
+      });
+      const dates = Object.keys(aggMap).sort();
+      const upValues = dates.map(d => aggMap[d].up);
+      const downValues = dates.map(d => aggMap[d].down);
+      return { dates, upValues, downValues };
+    }
+
+    // Main dashboard builder
+    function buildDashboard(data) {
+      if (!data || !data.length) {
+        setKPI('-', '-', '-', '-', '-', '-', '-','-');
+        Plotly.purge('utilizationChart'); Plotly.purge('uptimeChart'); Plotly.purge('availabilityChart');
+        Plotly.purge('throughputChart'); Plotly.purge('failureChart'); Plotly.purge('matrixChart');
+        Plotly.purge('reliabilityMatrixChart'); Plotly.purge('utilTrendChart'); Plotly.purge('throughputTrendChart');
+        Plotly.purge('uptimePctTrendChart'); Plotly.purge('uptimeHoursTrendChart');
+        document.getElementById('kpi-underperforming').innerText = '-';
+        return;
+      }
+      
+      const plotLayout = { margin: { t: 30, b: 60, l: 80, r: 20 }, paper_bgcolor: '#f6f7fb', plot_bgcolor: '#fff' };
+
+      // Data pipeline for TREND charts
+      const { dates: utilDates, avgValues: avgUtil } = aggregateByDate(data, "UTILIZATION [%]");
+      const { dates: movesDates, totalValues: totalDailyMoves } = aggregateByDate(data, "ACTMOVE");
+      const { dates: udDates, upValues: upH, downValues: dnH } = aggregateUptimeDowntimeByDate(data);
+      const udPct = {
+        up: upH.map((u, i) => pct(u, u + dnH[i])),
+        down: dnH.map((d, i) => pct(d, upH[i] + d))
+      };
+
+      // Plot TREND charts
+      Plotly.newPlot('utilTrendChart', [{ x: utilDates, y: avgUtil, type: 'scatter', mode: 'lines+markers', marker: { color: 'blue' }, hovertemplate: 'Date: %{x}<br>Avg Util: %{y:.1f}%<extra></extra>'}],
+        { ...plotLayout, title: `Average Utilization Trend ${getChartTitleSuffix()}`, xaxis: { title: 'Date' }, yaxis: { title: 'Utilization %', automargin: true } });
+        
+      Plotly.newPlot('throughputTrendChart', [{ x: movesDates, y: totalDailyMoves, type: 'bar', marker: { color: 'green' }, hovertemplate: 'Date: %{x}<br>Total Moves: %{y}<extra></extra>' }],
+        { ...plotLayout, title: `Throughput Trend (Total Daily Moves) ${getChartTitleSuffix()}`, xaxis: { title: 'Date' }, yaxis: { title: 'Total Moves', automargin: true } });
+        
+      Plotly.newPlot('uptimePctTrendChart', [{ x: udDates, y: udPct.up, stackgroup: 'one', name: 'Uptime %', mode: 'lines', line: { color: 'teal' }, hovertemplate: 'Date: %{x}<br>Uptime: %{y:.1f}%<extra></extra>' },
+        { x: udDates, y: udPct.down, stackgroup: 'one', name: 'Downtime %', mode: 'lines', line: { color: 'tomato' }, hovertemplate: 'Date: %{x}<br>Downtime: %{y:.1f}%<extra></extra>' }],
+        { ...plotLayout, title: `Uptime vs Downtime % Trend ${getChartTitleSuffix()}`, xaxis: { title: 'Date' }, yaxis: { title: '%', automargin: true } });
+        
+      Plotly.newPlot('uptimeHoursTrendChart', [{ x: udDates, y: upH, type: 'scatter', mode: 'lines+markers', name: 'Uptime Hours', line: { color: 'teal' }, hovertemplate: 'Date: %{x}<br>Uptime: %{y:.1f} h<extra></extra>' },
+        { x: udDates, y: dnH, type: 'scatter', mode: 'lines+markers', name: 'Downtime Hours', line: { color: 'tomato' }, hovertemplate: 'Date: %{x}<br>Downtime: %{y:.1f} h<extra></extra>' }],
+        { ...plotLayout, title: `Uptime vs Downtime Hours Trend ${getChartTitleSuffix()}`, xaxis: { title: 'Date' }, yaxis: { title: 'Hours', automargin: true } });
+
+      // Data pipeline for BAR charts & KPIs
+      const aggregatedData = aggregateByTool(data);
+      const ids = aggregatedData.map(d => d.TOOLID || "Unknown");
+      const util = aggregatedData.map(d => num(d["UTILIZATION [%]"]));
+      const avail = aggregatedData.map(d => num(d["AVAILABLE [%]"]));
+      const totalToolMoves = aggregatedData.map(d => num(d.ACTMOVE));
+      const avgDailyToolMoves = aggregatedData.map(d => num(d.avg_moves_per_day));
+      const fails = aggregatedData.map(d => num(d.FAILCOUNT));
+      
+      const st_run = aggregatedData.map(d => num(d.ST_RUN)),
+            st_idle = aggregatedData.map(d => num(d.ST_IDLE)),
+            st_engr = aggregatedData.map(d => num(d.ST_ENGR)),
+            st_fail = aggregatedData.map(d => num(d.ST_FAILED)),
+            st_pm = aggregatedData.map(d => num(d.ST_PM)),
+            st_shut = aggregatedData.map(d => num(d.ST_SHUTDOWN)),
+            st_qual = aggregatedData.map(d => num(d.ST_QUAL)),
+            st_delq = aggregatedData.map(d => num(d.ST_DELQ)),
+            st_non = aggregatedData.map(d => num(d.ST_NONSCH)),
+            st_wait = aggregatedData.map(d => num(d.ST_WAIT));
+            
+      const up = ids.map((_, i) => st_run[i] + st_idle[i] + st_engr[i]);
+      const down = ids.map((_, i) => st_fail[i] + st_pm[i] + st_shut[i] + st_qual[i] + st_delq[i] + st_non[i] + st_wait[i]);
+      
+      const mtbf = fails.map((f, i) => f > 0 ? up[i] / f : NaN);
+      const mttr = fails.map((f, i) => f > 0 ? st_fail[i] / f : NaN);
+
+      // Calculate overall uptime percentage for the selected timeframe
+      const totalUptimeHours = sum(data.map(d => num(d.ST_RUN) + num(d.ST_IDLE) + num(d.ST_ENGR)));
+      const totalDowntimeHours = sum(data.map(d => num(d.ST_FAILED) + num(d.ST_PM) + num(d.ST_SHUTDOWN) + num(d.ST_QUAL) + num(d.ST_DELQ) + num(d.ST_NONSCH) + num(d.ST_WAIT)));
+      const totalUptimePct = pct(totalUptimeHours, totalUptimeHours + totalDowntimeHours);
+      
+      setKPI(totalUptimePct.toFixed(2) + '%', avg(util).toFixed(1) + '%', avg(avail).toFixed(1) + '%', sum(up).toFixed(0) + ' h', sum(down).toFixed(0) + ' h', sum(fails).toFixed(0), avg(mtbf).toFixed(1) + ' h', avg(mttr).toFixed(1) + ' h');
+
+      // Identify and highlight underperforming tools
+      const underperformingTools = ids.filter((_, i) => {
+        const totalTime = up[i] + down[i];
+        const uptimePct = totalTime ? (up[i] / totalTime) * 100 : 0;
+        return uptimePct < 94;
+      });
+      document.getElementById('kpi-underperforming').innerText = underperformingTools.length > 0 ? underperformingTools.join(', ') : 'All tools above 94%';
+
+      // Utilization Chart
+      Plotly.newPlot('utilizationChart', [{ x: ids, y: util, type: 'bar', marker: { color: 'steelblue' },
+        hovertemplate: 'Tool: %{x}<br>Utilization: %{y:.1f}%<extra></extra>' }],
+        { ...plotLayout, title: `Utilization Rate by Tool ${getChartTitleSuffix()}`, xaxis: { title: 'Tool', automargin: true }, yaxis: { title: 'Utilization (%)', range: [0, 100] } });
+
+      // Uptime vs Downtime - with color coding for underperformance
+      const upPct = up.map((u, i) => pct(u, u + down[i])),
+            dnPct = down.map((d, i) => pct(d, up[i] + d));
+      const upHoursText = up.map(h => `Uptime: ${h.toFixed(1)} h`);
+      const downHoursText = down.map(h => `Downtime: ${h.toFixed(1)} h`);
+
+      Plotly.newPlot('uptimeChart', [
+        { x: ids, y: upPct, name: 'Uptime %', type: 'bar', marker: { color: 'teal' }, text: upHoursText,
+        hovertemplate: '%{x}<br>Uptime: %{y:.1f}%<br>%{text}<extra></extra>'},
+        { x: ids, y: dnPct, name: 'Downtime %', type: 'bar', marker: { color: 'tomato' }, text: downHoursText,
+        hovertemplate: '%{x}<br>Downtime: %{y:.1f}%<br>%{text}<extra></extra>'}
+      ], { ...plotLayout, barmode: 'stack', title: `Uptime vs Downtime by Tool ${getChartTitleSuffix()}`, xaxis: { title: 'Tool', automargin: true }, yaxis: { title: 'Percentage (%)', range: [0, 100], automargin: true },
+        updatemenus: [{ buttons: [
+          { args: [{ y: [up, down], hovertemplate: ['%{x}<br>Uptime: %{y:.1f} h<extra></extra>', '%{x}<br>Downtime: %{y:.1f} h<extra></extra>'] }, { yaxis: { title: 'Hours', automargin: true } }], label: 'Hours', method: 'update' },
+          { args: [{ y: [upPct, dnPct], hovertemplate: ['%{x}<br>Uptime: %{y:.1f}%<br>%{text}<extra></extra>', '%{x}<br>Downtime: %{y:.1f}%<br>%{text}<extra></extra>'] }, { yaxis: { title: 'Percentage (%)', range: [0, 100], automargin: true } }], label: 'Percentage', method: 'update' }
+        ], type: 'buttons', x: 0, y: 1.15 } ] });
+
+      // Availability Breakdown
+      const tot = ids.map((_, i) => st_run[i] + st_idle[i] + st_fail[i] + st_pm[i] + st_engr[i] + st_shut[i]);
+      const toPct = a => a.map((v, i) => pct(v, tot[i]));
+      const hrs = [st_run, st_idle, st_fail, st_pm, st_engr, st_shut];
+      const pctArr = [toPct(st_run), toPct(st_idle), toPct(st_fail), toPct(st_pm), toPct(st_engr), toPct(st_shut)];
+      const hrsText = hrs.map(arr => arr.map(h => `Hours: ${h.toFixed(1)}`));
+
+      Plotly.newPlot('availabilityChart', [
+        { x: ids, y: pctArr[0], name: 'Run %', type: 'bar', text: hrsText[0], hovertemplate: '%{x}<br>Run: %{y:.1f}%<br>%{text}<extra></extra>' },
+        { x: ids, y: pctArr[1], name: 'Idle %', type: 'bar', text: hrsText[1], hovertemplate: '%{x}<br>Idle: %{y:.1f}%<br>%{text}<extra></extra>' },
+        { x: ids, y: pctArr[2], name: 'Failed %', type: 'bar', text: hrsText[2], hovertemplate: '%{x}<br>Failed: %{y:.1f}%<br>%{text}<extra></extra>' },
+        { x: ids, y: pctArr[3], name: 'PM %', type: 'bar', text: hrsText[3], hovertemplate: '%{x}<br>PM: %{y:.1f}%<br>%{text}<extra></extra>' },
+        { x: ids, y: pctArr[4], name: 'Engr %', type: 'bar', text: hrsText[4], hovertemplate: '%{x}<br>Engr: %{y:.1f}%<br>%{text}<extra></extra>' },
+        { x: ids, y: pctArr[5], name: 'Shutdown %', type: 'bar', text: hrsText[5], hovertemplate: '%{x}<br>Shutdown: %{y:.1f}%<br>%{text}<extra></extra>' }
+      ], { ...plotLayout, barmode: 'stack', title: `Availability vs Downtime Breakdown ${getChartTitleSuffix()}`, xaxis: { title: 'Tool', automargin: true }, yaxis: { title: 'Percentage (%)', range: [0, 100], automargin: true },
+        updatemenus: [{ buttons: [
+          { args: [{ y: hrs, hovertemplate: ['%{x}<br>Run: %{y:.1f} h<extra></extra>', '%{x}<br>Idle: %{y:.1f} h<extra></extra>', '%{x}<br>Failed: %{y:.1f} h<extra></extra>', '%{x}<br>PM: %{y:.1f} h<extra></extra>', '%{x}<br>Engr: %{y:.1f} h<extra></extra>', '%{x}<br>Shutdown: %{y:.1f} h<extra></extra>'] }, { yaxis: { title: 'Hours', automargin: true } }], label: 'Hours', method: 'update' },
+          { args: [{ y: pctArr, hovertemplate: ['%{x}<br>Run: %{y:.1f}%<br>%{text}<extra></extra>', '%{x}<br>Idle: %{y:.1f}%<br>%{text}<extra></extra>', '%{x}<br>Failed: %{y:.1f}%<br>%{text}<extra></extra>', '%{x}<br>PM: %{y:.1f}%<br>%{text}<extra></extra>', '%{x}<br>Engr: %{y:.1f}%<br>%{text}<extra></extra>', '%{x}<br>Shutdown: %{y:.1f}%<br>%{text}<extra></extra>'] }, { yaxis: { title: 'Percentage (%)', range: [0, 100], automargin: true } }], label: 'Percentage', method: 'update' }
+        ], type: 'buttons', x: 0, y: 1.15 } ] });
+
+      // Throughput
+      Plotly.newPlot('throughputChart', [{ x: ids, y: totalToolMoves, type: 'bar', marker: { color: 'green' }, hovertemplate: 'Tool: %{x}<br>Total Moves: %{y}<br>Avg. Daily Moves: %{customdata:.1f}<extra></extra>', customdata: avgDailyToolMoves }],
+        { ...plotLayout, title: `Throughput (ACTMOVE) by Tool ${getChartTitleSuffix()}`, xaxis: { title: 'Tool', automargin: true }, yaxis: { title: 'Moves', automargin: true } });
+        
+      // Failures
+      Plotly.newPlot('failureChart', [{ x: ids, y: fails, type: 'bar', marker: { color: 'crimson' }, hovertemplate: 'Tool: %{x}<br>Failures: %{y}<extra></extra>' }],
+        { ...plotLayout, title: `Failure Events by Tool ${getChartTitleSuffix()}`, xaxis: { title: 'Tool', automargin: true }, yaxis: { title: 'Count', automargin: true } });
+        
+      // Performance Matrix
+      Plotly.newPlot('matrixChart', [{ x: avail, y: util, text: ids.map((id, i) => id + '<br>Moves:' + totalToolMoves[i] + '<br>Failures:' + fails[i]), mode: 'markers',
+        marker: { size: totalToolMoves.map(m => Math.sqrt(m) || 5), color: 'orange', opacity: 0.7 }, hovertemplate: 'Tool: %{text}<br>Availability: %{x:.1f}%<br>Utilization: %{y:.1f}%<extra></extra>' }],
+        { ...plotLayout, title: `Performance Matrix ${getChartTitleSuffix()}`, xaxis: { title: 'Availability %' }, yaxis: { title: 'Utilization %', automargin: true } });
+
+      // Reliability Matrix
+      Plotly.newPlot('reliabilityMatrixChart', [{ x: mttr, y: mtbf, text: ids, mode: 'markers',
+        marker: { color: 'green', size: 12, opacity: 0.7 }, hovertemplate: 'Tool: %{text}<br>MTTR: %{x:.1f} h<br>MTBF: %{y:.1f} h<extra></extra>' }],
+        { ...plotLayout, title: `Reliability Matrix (MTBF vs. MTTR) ${getChartTitleSuffix()}`, xaxis: { title: 'MTTR (Hours)' }, yaxis: { title: 'MTBF (Hours)', automargin: true } });
+    }
+
+    // Helper function to get chart title suffix
+    function getChartTitleSuffix() {
+        const selA = Array.from(document.getElementById('areaFilter').selectedOptions).map(o => o.value);
+        const selT = Array.from(document.getElementById('toolFilter').selectedOptions).map(o => o.value);
+        const sDate = document.getElementById('startDate').value;
+        const eDate = document.getElementById('endDate').value;
+        let suffix = '';
+
+        if (selT.length > 0) {
+            if (selT.length <= 2) {
+                suffix += `for ${selT.join(', ')} `;
+            } else {
+                suffix += `for ${selT[0]}, ${selT[1]}... and ${selT.length - 2} more tools `;
+            }
+        }
+
+        if (selA.length > 0) suffix += `in ${selA.join(', ')} `;
+        if (sDate || eDate) {
+            const dateRange = (sDate && eDate) ? `${sDate} to ${eDate}` : (sDate ? `from ${sDate}` : `to ${eDate}`);
+            suffix += `from ${dateRange}`;
+        }
+        return suffix.trim();
+    }
+
+    // Utility functions
+    function num(v) { return parseFloat(v) || 0; }
+    function avg(a) { const f = a.filter(v => !isNaN(v)); return f.length ? sum(f) / f.length : 0; }
+    function sum(a) { return a.reduce((x, y) => x + y, 0); }
+    function pct(v, t) { return t ? (v / t * 100) : 0; }
+    function parseDate(v) {
+      if (!v) return null;
+      const s = String(v);
+      if (s.length === 8 && !isNaN(s)) {
+        return new Date(s.slice(0, 4) + '-' + s.slice(4, 6) + '-' + s.slice(6, 8));
+      }
+      const d = new Date(v);
+      return isNaN(d) ? null : d;
+    }
+    function toYMD(d) { return d.toISOString().slice(0, 10); }
+    
+    // KPI setter
+    function setKPI(totalUptimePct, u, a, up, down, f, mtbf, mttr) {
+      document.getElementById('kpi-total-uptime-pct').innerText = totalUptimePct;
+      document.getElementById('kpi-util').innerText = u;
+      document.getElementById('kpi-avail').innerText = a;
+      document.getElementById('kpi-uptime').innerText = up;
+      document.getElementById('kpi-downtime').innerText = down;
+      document.getElementById('kpi-fail').innerText = f;
+      document.getElementById('kpi-mtbf').innerText = mtbf;
+      document.getElementById('kpi-mttr').innerText = mttr;
+    }
+  </script>
+</body>
+</html>
